@@ -78,7 +78,7 @@ never stashes.
 | Rebase / merge / cherry-pick / revert / bisect in progress | `skipped` |
 | Detached HEAD, under `--checkout` | `skipped` |
 | No remote, or several remotes and no `origin` | `skipped` |
-| Default branch checked out in another worktree | `skipped` |
+| Default branch checked out in another worktree | `skipped` (both modes, and in `--dry-run`) |
 | Remote has zero branches (empty repo) | `skipped` |
 
 Skips are normal and **do not** fail the run. Only auth failures, network
@@ -145,6 +145,14 @@ $EDITOR ~/.git-ffwd.env          # set GIT_FFWD_ROOTS at minimum
 reports "up to date" for repos that are actually behind, which makes it worse
 than useless. Use `--offline` if you genuinely want no network contact.
 
+`--offline` contacts no remote in any mode. Advancing a branch that is not
+checked out is a pure ref move, so it is done locally with `git update-ref`
+rather than a refspec fetch — the diverged check has already proved it is a
+fast-forward. One exception to "touches nothing remote": under
+`--dry-run --refresh-default` *without* `--offline`, `git remote set-head` asks
+the remote and rewrites `refs/remotes/<remote>/HEAD`. That is a remote-tracking
+ref, not a local branch or a working tree, but it is a write.
+
 ### Statuses
 
 `updated`, `up-to-date`, `skipped`, `failed`. Under `--dry-run` these become
@@ -173,7 +181,7 @@ are exported. Command-line flags override environment values.
 | `GIT_FFWD_LABEL` | `com.user.GitFastForward` | Used to derive the default log path. |
 | `GIT_FFWD_LOG` | `~/Library/Logs/<label>.log` | **Must match what the scheduler redirects to.** |
 | `GIT_FFWD_LOG_LINES` | `2000` | Lines kept when trimming. |
-| `GIT_FFWD_ENV` | `~/.git-ffwd.env` | Alternate config path. |
+| `GIT_FFWD_ENV` | `~/.git-ffwd.env` | Alternate config path. **Environment only** — it is read to find the config file, so setting it *inside* that file has no effect. |
 
 Never put a token or password in this file. Git auth comes from an SSH key or a
 credential helper.
@@ -306,6 +314,14 @@ trims a different file than the one being appended to.
 
 ```cron
 0 8 * * * $HOME/scheduled-jobs/git-ffwd/run_git-ffwd.sh >> $HOME/Library/Logs/run_git-ffwd.log 2>&1
+```
+
+**Set `GIT_FFWD_LOG` to match that path.** Left unset it defaults to
+`~/Library/Logs/$GIT_FFWD_LABEL.log`, i.e. `com.user.GitFastForward.log`, so the
+wrapper would trim a file cron never writes to while the real log grew forever:
+
+```bash
+GIT_FFWD_LOG="$HOME/Library/Logs/run_git-ffwd.log"
 ```
 
 On macOS, cron needs Full Disk Access before it can touch `~/Documents`,
@@ -452,10 +468,32 @@ stay in `$LOG.tmp`, until the next run's `tail` overwrites it.
 
 ### Overlapping runs
 
-A `mkdir`-based lock at `~/.cache/git-ffwd-all.lock`, because macOS ships no
-`flock(1)`. If a previous run is still going, the new one logs a line and exits
-**0** — an overlap is normal, not a failure. A lock whose PID is gone is treated
-as stale and cleared.
+`mkdir`-based locks, because macOS ships no `flock(1)`. If a previous run is
+still going, the new one logs a line and exits **0** — an overlap is normal, not
+a failure. A lock whose PID is gone is treated as stale and cleared.
+
+There are **two**, keyed on different things because they protect different
+things:
+
+| Lock | Held by | Keyed on | Protects |
+|---|---|---|---|
+| `~/.cache/git-ffwd-wrapper-<log>.lock` | `run_git-ffwd.sh` | the **log** basename | `$LOG.tmp` and the trim |
+| `~/.cache/<lock-name>-all.lock` | `git-ffwd.sh` | `--lock-name` | the fetching |
+
+The wrapper needs its own because it trims the log *before* the worker starts,
+so the worker's lock cannot cover that. It is keyed on the log rather than on
+`--lock-name` because what must not be shared is `$LOG.tmp`: two jobs with
+different lock names but the same log would still clobber each other's trim.
+Conversely two jobs with different logs may safely trim at once, and are then
+serialised only where it matters, by `--lock-name` in the worker.
+
+The wrapper does not `exec` the worker, because `exec` would replace the process
+before its trap could release the lock.
+
+**On the stale check:** `mkdir` and writing the pid are two steps, so a holder
+that has just won the `mkdir` may not have written its pid yet. Treating that as
+stale would let two runs in at once. A missing pid is therefore re-checked for
+up to 2s before the lock is declared abandoned.
 
 ---
 

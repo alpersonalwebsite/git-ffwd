@@ -141,6 +141,16 @@ done
 [[ -n $LOCK_NAME && $LOCK_NAME != *[^A-Za-z0-9._-]* ]] \
   || die "--lock-name must be non-empty and only letters, digits, dot, dash or underscore"
 
+# Normalise the boolean env vars. They were compared against a literal 1, so
+# GIT_FFWD_REFRESH_DEFAULT=true silently did nothing, unlike DEPTH/JOBS/TIMEOUT
+# which are validated.
+for _v in REFRESH_DEFAULT OFFLINE; do
+  case ${(P)_v} in
+    1|true|yes|on)   eval "$_v=1" ;;
+    0|false|no|off|"") eval "$_v=0" ;;
+    *) die "GIT_FFWD_$_v must be 1/0 (or true/false, yes/no), got: ${(P)_v}" ;;
+  esac
+done
 [[ $DEPTH   == <-> && $DEPTH   -ge 1 ]] || die "--depth must be a positive integer"
 [[ $JOBS    == <-> && $JOBS    -ge 1 ]] || die "--jobs must be a positive integer"
 [[ $TIMEOUT == <-> && $TIMEOUT -ge 1 ]] || die "--timeout must be a positive integer"
@@ -155,7 +165,22 @@ done
 LOCKDIR="$HOME/.cache/${LOCK_NAME}-all.lock"
 mkdir -p "${LOCKDIR:h}" 2>/dev/null
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
-  OTHER=$(<"$LOCKDIR/pid" 2>/dev/null) || OTHER=""
+  # `cat`, not zsh's $(<file): the $(<...) fast path bypasses the redirection,
+  # so 2>/dev/null does not suppress its error and a raw "no such file or
+  # directory" lands in the log ahead of the intended message.
+  OTHER=$(cat "$LOCKDIR/pid" 2>/dev/null) || OTHER=""
+  if [[ -z $OTHER ]]; then
+    # mkdir and the pid write are two steps. A holder that has just won the
+    # mkdir may not have written its pid yet, and treating that as stale lets a
+    # second run straight through -- both then run, and the first one's cleanup
+    # removes the second's lock. Look again before deciding.
+    local _t
+    for _t in 1 2 3 4 5; do
+      sleep 0.4
+      OTHER=$(cat "$LOCKDIR/pid" 2>/dev/null) && [[ -n $OTHER ]] && break
+      OTHER=""
+    done
+  fi
   if [[ -n $OTHER ]] && kill -0 "$OTHER" 2>/dev/null; then
     print -r -- "$(date -u +%FT%TZ) another run is active (pid $OTHER), exiting"
     exit 0                      # a normal overlap, not a failure
@@ -421,6 +446,16 @@ process_repo() {
   local dirty=0
   [[ -n $(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null) ]] && dirty=1
 
+  # A branch checked out in a linked worktree cannot be updated by either mode:
+  # the refspec fetch is refused, `git checkout` fails, and moving the ref with
+  # update-ref would leave that worktree's index silently stale. Detect it here
+  # so the preview and the run agree, rather than discovering it from an error
+  # message in only one of them.
+  if [[ $cur != $def ]] \
+     && git -C "$repo" worktree list --porcelain 2>/dev/null | grep -qx "branch refs/heads/$def"; then
+    emit skipped "$def" "$def is checked out in another worktree"; return
+  fi
+
   local ahead=""
   if [[ -n $before ]]; then
     ahead=$(git -C "$repo" rev-list --count "$target..$before" 2>/dev/null) || ahead=""
@@ -460,7 +495,15 @@ process_repo() {
     fi
     if [[ $cur != $def ]]; then
       if ! git -C "$repo" checkout --quiet "$def" 2>"$errf"; then
-        emit failed "$def" "checkout failed: $(brief_error "$errf")"; return
+        local cmsg; cmsg=$(brief_error "$errf")
+        # Belt and braces: the worktree case is caught earlier, but git also
+        # reports it here and it is a skip, not a failure.
+        case $cmsg in
+          *"already checked out"*|*"is already used by worktree"*)
+            emit skipped "$def" "$def is checked out in another worktree" ;;
+          *) emit failed "$def" "checkout failed: $cmsg" ;;
+        esac
+        return
       fi
     fi
     if ! git -C "$repo" merge --ff-only --quiet "$remote/$def" 2>"$errf"; then
@@ -478,6 +521,21 @@ process_repo() {
         emit failed "$def" "ff-only merge failed: $(brief_error "$errf")"; return
       fi
     else
+      if (( OFFLINE )); then
+        # --offline must mean it. Advancing a branch that is not checked out is
+        # a pure ref move, and the diverged check above already proved $before
+        # is an ancestor of $target, so no network is needed. Fetching here
+        # contradicted the banner and failed the whole run against an
+        # unreachable remote. The old value is passed so a concurrent change
+        # loses rather than being overwritten.
+        if ! git -C "$repo" update-ref -m "git-ffwd: fast-forward from $remote/$def" \
+             "refs/heads/$def" "$target" "$before" 2>"$errf"; then
+          emit failed "$def" "offline fast-forward failed: $(brief_error "$errf")"; return
+        fi
+        if [[ -z $before ]]; then emit updated "$def" "created at ${target[1,7]}"
+        else emit updated "$def" "$range ($behind commit(s))"; fi
+        return
+      fi
       # The whole point of the default mode: updates refs/heads/$def without a
       # checkout, so whatever branch is out stays out and the index is untouched.
       git_net "$errf" -C "$repo" fetch "$remote" "$def:$def"
@@ -533,7 +591,11 @@ for repo in "${SELECTED[@]}"; do (( ${#${repo:t}} > width )) && width=${#${repo:
 
 failed=0
 for i in {1..$idx}; do
-  [[ -f $WORK/$i.line ]] || { print -r -- "  ??? worker $i produced no result"; (( failed++ )); continue }
+  # Count it too, or the summary reads "done: nothing" on a run that failed.
+  [[ -f $WORK/$i.line ]] || {
+    print -r -- "  ??? worker $i produced no result"
+    (( failed++ )); COUNT[failed]=$(( ${COUNT[failed]:-0} + 1 )); continue
+  }
   IFS=$'\t' read -r st nm br detail < "$WORK/$i.line"
   COUNT[$st]=$(( ${COUNT[$st]:-0} + 1 ))
   printf '  %-12s %-*s %-20s %s\n' "$st" "$width" "$nm" "$br" "$detail"

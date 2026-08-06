@@ -54,10 +54,29 @@ if [[ -z $LOCK_NAME || $LOCK_NAME == *[^A-Za-z0-9._-]* ]]; then
   print -ru2 -- "$(ts) $SELF: GIT_FFWD_LOCK_NAME must be non-empty and only letters, digits, dot, dash or underscore (got: $LOCK_NAME)"
   exit 2
 fi
-LOCK="$HOME/.cache/${LOCK_NAME}-wrapper.lock"
+# Keyed on the LOG, not on LOCK_NAME. What this lock protects is $LOG.tmp, so
+# the thing that must not be shared is the log path: two jobs with different
+# lock names but the same log would still clobber each other's trim. The worker
+# has its own LOCK_NAME lock for the fetching, which is a separate concern.
+# Sanitising the basename can over-lock two same-named logs in different
+# directories; over-locking is the safe direction.
+LOG_TOKEN=${${LOG:t:r}//[^A-Za-z0-9._-]/_}
+LOCK="$HOME/.cache/git-ffwd-wrapper-${LOG_TOKEN:-default}.lock"
 mkdir -p "${LOCK:h}" 2>/dev/null
 if ! mkdir "$LOCK" 2>/dev/null; then
-  other=$(<"$LOCK/pid" 2>/dev/null) || other=""
+  # `cat`, not zsh's $(<file): the $(<...) fast path bypasses the redirection,
+  # so 2>/dev/null does not suppress its error.
+  other=$(cat "$LOCK/pid" 2>/dev/null) || other=""
+  if [[ -z $other ]]; then
+    # mkdir and the pid write are two steps; a holder that just won the mkdir
+    # may not have written its pid yet. Look again before calling it stale.
+    typeset _t
+    for _t in 1 2 3 4 5; do
+      sleep 0.4
+      other=$(cat "$LOCK/pid" 2>/dev/null) && [[ -n $other ]] && break
+      other=""
+    done
+  fi
   if [[ -n $other ]] && kill -0 "$other" 2>/dev/null; then
     print -r -- "$(ts) another run is active (pid $other), exiting"
     exit 0                        # a normal overlap, not a failure
