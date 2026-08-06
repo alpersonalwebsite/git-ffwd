@@ -414,7 +414,7 @@ process_repo() {
     # update rather than something that went wrong. Counted locally from the
     # refs the fetch just wrote, so this costs no extra round trip.
     if [[ -z $(git -C "$repo" for-each-ref --format='%(refname)' "refs/remotes/$remote/" 2>/dev/null \
-               | grep -v "^refs/remotes/$remote/HEAD\$") ]]; then
+               | grep -vxF "refs/remotes/$remote/HEAD") ]]; then
       emit skipped "" "remote has no branches (empty repo)"; return
     fi
     emit failed "" "cannot determine default branch on $remote"; return
@@ -446,13 +446,20 @@ process_repo() {
   local dirty=0
   [[ -n $(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null) ]] && dirty=1
 
+  # -F, not a regex: branch and remote names are interpolated into these
+  # patterns, and an unescaped `.` matches any character. A repo whose default
+  # branch is v1.0 with another worktree on v1x0 was reported as "checked out in
+  # another worktree" and silently never updated -- the tool quietly not doing
+  # its job on a repo it claims to have handled. -x keeps the whole-line match.
+  #
   # A branch checked out in a linked worktree cannot be updated by either mode:
   # the refspec fetch is refused, `git checkout` fails, and moving the ref with
   # update-ref would leave that worktree's index silently stale. Detect it here
   # so the preview and the run agree, rather than discovering it from an error
   # message in only one of them.
   if [[ $cur != $def ]] \
-     && git -C "$repo" worktree list --porcelain 2>/dev/null | grep -qx "branch refs/heads/$def"; then
+     && git -C "$repo" worktree list --porcelain 2>/dev/null \
+        | grep -qxF "branch refs/heads/$def"; then
     emit skipped "$def" "$def is checked out in another worktree"; return
   fi
 
