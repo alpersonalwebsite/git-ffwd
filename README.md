@@ -155,8 +155,21 @@ ref, not a local branch or a working tree, but it is a write.
 
 ### Statuses
 
-`updated`, `up-to-date`, `skipped`, `failed`. Under `--dry-run` these become
-`would-update`, `would-create`, `would-skip`.
+`updated`, `up-to-date`, `skipped`, `failed`.
+
+`--dry-run` does **not** rename all of them. Only the action it would have taken
+gets a `would-` prefix; everything decided before that point reports exactly as
+it does in a real run:
+
+| Real run | Under `--dry-run` |
+|---|---|
+| `updated` | `would-update`, or `would-create` if the local branch does not exist yet |
+| `skipped` for a reason found while acting (dirty tree, detached under `--checkout`) | `would-skip` |
+| `up-to-date` | `up-to-date` — unchanged |
+| `skipped` for a reason found before acting (diverged, operation in progress, no remote, empty remote, checked out in another worktree) | `skipped` — unchanged |
+| `failed` | `failed` — unchanged. A dry run still fetches, so auth and network failures surface here too |
+
+So a bare `skipped` or `failed` in a preview is expected, not a bug.
 
 ---
 
@@ -286,7 +299,13 @@ never git, since `core.sshCommand` always supplies `-i`. Confirm every repo
 actually resolves one before enabling it:
 
 ```bash
-find <root> -mindepth 2 -maxdepth 2 -name .git -print0 | while IFS= read -r -d '' g; do
+# Mirrors the tool's own discovery. Use every root in GIT_FFWD_ROOTS and the
+# same GIT_FFWD_DEPTH, or the audit reports a clean result for repos it never
+# looked at -- maxdepth only, exactly like the run, so a root that is itself a
+# repo is included.
+for root in <root> <another-root>; do
+  find "$root" -maxdepth "${GIT_FFWD_DEPTH:-2}" -name .git -print0
+done | while IFS= read -r -d '' g; do
   r=$(dirname "$g")
   [ -z "$(git -C "$r" config --get core.sshCommand)" ] && echo "no identity: $r"
 done
@@ -305,7 +324,10 @@ helper (a PAT in `~/.git-credentials` is likewise a plaintext secret on disk).
 ## Scheduling
 
 The scheduled entry point is `run_git-ffwd.sh`, which takes **no arguments** —
-some schedulers cannot pass any. All configuration comes from `~/.git-ffwd.env`.
+some schedulers cannot pass any. Configuration comes from `~/.git-ffwd.env`, or
+from whatever path `GIT_FFWD_ENV` points at when the scheduler exports it. That
+one variable can only come from the environment, since it is what locates the
+config file; setting it *inside* the file has no effect.
 
 Whatever you use, the redirect target must match `GIT_FFWD_LOG`, or the wrapper
 trims a different file than the one being appended to.
@@ -420,8 +442,11 @@ Consequences worth knowing:
 
 - **Edit the real file, not the link.** Some editors and tools refuse to write
   through a symlink, and those that do may replace it with a regular file,
-  silently detaching it from the repo. Resolve it first:
-  `readlink -f ~/.ssh/config`.
+  silently detaching it from the repo. Resolve it first with
+  `readlink -f ~/.ssh/config`. Verified working with the built-in
+  `/usr/bin/readlink` on macOS 15.6.1; `-f` is absent from older releases, where
+  `greadlink -f` from coreutils, or the `ls -l` output above, gives the same
+  answer.
 - **The live config follows the checked-out branch.** If the change is on a
   feature branch and you switch back to the default branch, the block disappears
   from `~/.ssh/config` and scheduled jobs start failing with `Permission denied
