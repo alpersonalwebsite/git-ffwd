@@ -1,0 +1,19 @@
+# Config lives at ~/.git-ffwd.env, outside this folder, but guard against a
+# local copy being committed.
+.git-ffwd.env
+*.env
+!*.env.example
+
+.env*
+!.env.example
+*.log
+logs/
+secrets/
+credentials*
+*.pem
+*.key
+node_modules/
+__pycache__/
+.DS_Store
+*.sqlite
+*.db
