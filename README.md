@@ -30,8 +30,11 @@ identities in different directories.
 - [Scheduling](#scheduling)
 - [macOS TCC](#macos-tcc)
 - [Everything outside this repo](#everything-outside-this-repo)
+- [When the credential is not there yet](#when-the-credential-is-not-there-yet)
+- [Overlapping runs](#overlapping-runs)
 - [Setting it up on another machine](#setting-it-up-on-another-machine)
 - [Troubleshooting](#troubleshooting)
+- [Requirements](#requirements)
 
 ---
 
@@ -493,7 +496,7 @@ the log, and the run continues — trimming is housekeeping and should not kill 
 sync, but it must not fail silently. When the rewrite fails the retained lines
 stay in `$LOG.tmp`, until the next run's `tail` overwrites it.
 
-### When the credential is not there yet
+## When the credential is not there yet
 
 On macOS the login keychain is not reachable from a cron process until the
 machine has been interactively unlocked. A job scheduled before you sit down
@@ -587,8 +590,13 @@ git -C <a-personal-repo> config --get core.sshCommand
 ./git-ffwd.sh --dry-run --jobs 8
 ./run_git-ffwd.sh
 
-# 7. Full dress rehearsal: no agent, minimal env, like a scheduler
+# 7. Full dress rehearsal: no agent, minimal env, like a scheduler.
+#    GIT_FFWD_RETRY_ON_AUTH=0 because this step deliberately reproduces the
+#    no-credential condition the retry exists for -- without it the rehearsal
+#    would sit for 5 minutes and then try again, which is not what you want
+#    from a check you are watching.
 env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  GIT_FFWD_RETRY_ON_AUTH=0 \
   /bin/sh -c "$HOME/scheduled-jobs/git-ffwd/run_git-ffwd.sh; echo exit=\$?"
 
 # 8. Only then register the cron entry or Launch Agent
