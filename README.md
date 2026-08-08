@@ -188,6 +188,8 @@ are exported. Command-line flags override environment values.
 | `GIT_FFWD_INCLUDE` / `GIT_FFWD_EXCLUDE` | *(none)* | Comma-separated folder-name globs. |
 | `GIT_FFWD_REFRESH_DEFAULT` | `0` | Re-ask each remote for HEAD every run. |
 | `GIT_FFWD_LOCK_NAME` | `git-ffwd` | Lock identity. Two jobs sharing it block each other. |
+| `GIT_FFWD_RETRY_ON_AUTH` | `1` | Retry once when *every* repo fails on `publickey`. |
+| `GIT_FFWD_RETRY_DELAY` | `300` | Seconds to wait before that retry. |
 | `GIT_FFWD_OFFLINE` | `0` | Never contact a remote. |
 | `GIT_FFWD_SSH_OPTIONS` | `-o BatchMode=yes -o ConnectTimeout=10` | Appended to each repo's own ssh command. |
 | `GIT_FFWD_SSH_COMMAND` | *(none)* | Replaces the ssh command outright. Discards per-repo identity. |
@@ -491,7 +493,43 @@ the log, and the run continues — trimming is housekeeping and should not kill 
 sync, but it must not fail silently. When the rewrite fails the retained lines
 stay in `$LOG.tmp`, until the next run's `tail` overwrites it.
 
-### Overlapping runs
+### When the credential is not there yet
+
+On macOS the login keychain is not reachable from a cron process until the
+machine has been interactively unlocked. A job scheduled before you sit down
+therefore fails **wholesale** — every repo reporting
+`Permission denied (publickey)` — while the same job minutes later succeeds.
+
+Measured on two consecutive days: the 08:00 runs failed with all 100 repos on
+`publickey`, while runs at 08:43, 09:00 and 11:55 — same cron daemon, same
+script, same config, machine already in use — all passed.
+
+So `run_git-ffwd.sh` treats that shape as one missing credential rather than N
+broken repos: it logs the keychain and session state, waits
+`GIT_FFWD_RETRY_DELAY` (default 5 minutes) and runs once more, reporting the
+second result.
+
+Deliberately narrow:
+
+- Only a **near-total** failure retries (≥90% of repos, at least one on
+  `publickey`). A partial failure means those specific repos really are broken,
+  and retrying would hide that.
+- **Once**, never in a loop, so a revoked key fails the run instead of spinning
+  all morning.
+- The diagnostics are written *before* the retry, because that is the state that
+  cannot be recovered afterwards — the system log had already aged out by the
+  time the original failures were investigated, which left the cause inferred
+  rather than proven.
+
+Set `GIT_FFWD_RETRY_ON_AUTH=0` to turn it off.
+
+The underlying condition is a keychain-availability question, not a bug in this
+tool; the retry makes the job survive it. A passphrase-less deploy key removes
+the dependency entirely, at the cost of an unencrypted key on disk.
+
+---
+
+## Overlapping runs
 
 `mkdir`-based locks, because macOS ships no `flock(1)`. If a previous run is
 still going, the new one logs a line and exits **0** — an overlap is normal, not

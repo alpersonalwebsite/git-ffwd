@@ -86,7 +86,9 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   mkdir "$LOCK" || { print -ru2 -- "$(ts) $SELF: cannot create lock $LOCK"; exit 2 }
 fi
 print -r -- $$ > "$LOCK/pid"
-trap 'rm -rf "$LOCK"' EXIT
+OUT=""                                  # set once the run starts; see below
+cleanup() { rm -rf "$LOCK"; [[ -n $OUT ]] && rm -f "$OUT"; }
+trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 141' HUP PIPE
@@ -120,7 +122,77 @@ trim_log() {
 }
 trim_log "$LOG" "$KEEP_LINES" || true   # explicit: a trim failure must not abort the run
 
+# ── run, retrying once if the credential was unavailable ─────────────────────
+# A run where *every* repo fails with "Permission denied (publickey)" is not a
+# hundred broken repos, it is one missing credential. On macOS the login
+# keychain is not reachable from a cron process until the machine has been
+# interactively unlocked, so a job scheduled before you sit down fails wholesale
+# and a job a few minutes later succeeds. Measured on two consecutive days: the
+# 08:00 runs failed with all 100 repos on publickey, while runs at 08:43, 09:00
+# and 11:55 -- same cron daemon, same script, same config, machine already in
+# use -- all passed. Retrying once, later, turns that into a job that heals
+# itself instead of a status dot nobody looks at until the day it mattered.
+#
+# Deliberately narrow. Only a near-total failure retries, and only once:
+#  - a partial failure means those specific repos are genuinely broken, and
+#    retrying would hide real breakage;
+#  - looping would turn a revoked key into a job that spins all morning.
+RETRY=${GIT_FFWD_RETRY_ON_AUTH:-1}
+RETRY_DELAY=${GIT_FFWD_RETRY_DELAY:-300}
+case $RETRY in
+  1|true|yes|on)      RETRY=1 ;;
+  0|false|no|off|"")  RETRY=0 ;;
+  *) print -ru2 -- "$(ts) $SELF: GIT_FFWD_RETRY_ON_AUTH must be 1/0 (or true/false, yes/no), got: $RETRY"; exit 2 ;;
+esac
+[[ $RETRY_DELAY == <-> ]] \
+  || { print -ru2 -- "$(ts) $SELF: GIT_FFWD_RETRY_DELAY must be an integer, got: $RETRY_DELAY"; exit 2 }
+
+OUT=$(mktemp "${TMPDIR:-/tmp}/git-ffwd-run.XXXXXX") || OUT=""
+
+# tee so the run still streams to the log while leaving a copy to inspect.
+# stderr is not redirected, so warnings keep their stream; the failure rows the
+# check below reads are on stdout.
+run_worker() {
+  if [[ -n $OUT ]]; then
+    "$HERE/git-ffwd.sh" | tee "$OUT"
+    return ${pipestatus[1]}
+  fi
+  "$HERE/git-ffwd.sh"
+}
+
+# One missing credential, or N genuinely broken repos?
+auth_wipeout() {
+  [[ -n $OUT && -s $OUT ]] || return 1
+  local sel fail pk
+  sel=$(sed -n 's/^repos: \([0-9][0-9]*\) selected.*/\1/p' "$OUT" | head -1)
+  fail=$(grep -c "^  failed" "$OUT")
+  pk=$(grep -c "Permission denied (publickey)" "$OUT")
+  [[ -n $sel ]] && (( sel > 0 )) || return 1
+  (( pk > 0 && fail * 10 >= sel * 9 ))
+}
+
+# Recorded before the retry, because this is the state that could not be
+# captured after the fact: the unified log had already aged out by the time the
+# 08:00 failures were investigated, so the cause stayed inferred.
+diagnose() {
+  print -r -- "$(ts) diagnostics for the wholesale auth failure:"
+  print -r -- "  console user  : $(stat -f '%Su' /dev/console 2>/dev/null || print unknown)"
+  print -r -- "  SSH_AUTH_SOCK : ${SSH_AUTH_SOCK:-(unset)}"
+  print -r -- "  agent         : $(ssh-add -l 2>&1 | head -1)"
+  print -r -- "  login keychain: $(security show-keychain-info "$HOME/Library/Keychains/login.keychain-db" 2>&1 | head -1)"
+}
+
 # Not exec: the EXIT trap above has to survive to release the lock, and exec
 # would replace this process before it could run.
-"$HERE/git-ffwd.sh"
-exit $?
+run_worker
+rc=$?
+if (( rc != 0 && RETRY )) && auth_wipeout; then
+  diagnose
+  print -r -- "$(ts) every repo failed on publickey, so this is one unavailable credential rather than $(grep -c '^  failed' "$OUT") broken repos; retrying once in ${RETRY_DELAY}s"
+  sleep "$RETRY_DELAY"
+  print -r -- "$(ts) retrying"
+  run_worker
+  rc=$?
+  print -r -- "$(ts) retry finished with exit $rc"
+fi
+exit $rc
