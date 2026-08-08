@@ -63,30 +63,45 @@ fi
 LOG_TOKEN=${${LOG:t:r}//[^A-Za-z0-9._-]/_}
 LOCK="$HOME/.cache/git-ffwd-wrapper-${LOG_TOKEN:-default}.lock"
 mkdir -p "${LOCK:h}" 2>/dev/null
-if ! mkdir "$LOCK" 2>/dev/null; then
-  # `cat`, not zsh's $(<file): the $(<...) fast path bypasses the redirection,
-  # so 2>/dev/null does not suppress its error.
-  other=$(cat "$LOCK/pid" 2>/dev/null) || other=""
-  if [[ -z $other ]]; then
-    # mkdir and the pid write are two steps; a holder that just won the mkdir
-    # may not have written its pid yet. Look again before calling it stale.
-    typeset _t
-    for _t in 1 2 3 4 5; do
-      sleep 0.4
-      other=$(cat "$LOCK/pid" 2>/dev/null) && [[ -n $other ]] && break
-      other=""
-    done
+
+# Ownership is tracked explicitly: the retry below releases the lock while it
+# waits, and a cleanup that removed a lock this process no longer owns would
+# free another run's.
+OWN_LOCK=0
+acquire_lock() {   # 0 acquired, 1 another live run holds it, 2 unusable
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    # `cat`, not zsh's $(<file): the $(<...) fast path bypasses the redirection,
+    # so 2>/dev/null does not suppress its error.
+    local other; other=$(cat "$LOCK/pid" 2>/dev/null) || other=""
+    if [[ -z $other ]]; then
+      # mkdir and the pid write are two steps; a holder that just won the mkdir
+      # may not have written its pid yet. Look again before calling it stale.
+      local _t
+      for _t in 1 2 3 4 5; do
+        sleep 0.4
+        other=$(cat "$LOCK/pid" 2>/dev/null) && [[ -n $other ]] && break
+        other=""
+      done
+    fi
+    [[ -n $other ]] && kill -0 "$other" 2>/dev/null && return 1
+    print -ru2 -- "$(ts) $SELF: clearing stale lock $LOCK (pid ${other:-unknown} is gone)"
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || return 2
   fi
-  if [[ -n $other ]] && kill -0 "$other" 2>/dev/null; then
-    print -r -- "$(ts) another run is active (pid $other), exiting"
-    exit 0                        # a normal overlap, not a failure
-  fi
-  print -ru2 -- "$(ts) $SELF: clearing stale lock $LOCK (pid ${other:-unknown} is gone)"
-  rm -rf "$LOCK"
-  mkdir "$LOCK" || { print -ru2 -- "$(ts) $SELF: cannot create lock $LOCK"; exit 2 }
-fi
-print -r -- $$ > "$LOCK/pid"
-trap 'rm -rf "$LOCK"' EXIT
+  print -r -- $$ > "$LOCK/pid"
+  OWN_LOCK=1
+  return 0
+}
+release_lock() { (( OWN_LOCK )) && rm -rf "$LOCK"; OWN_LOCK=0; }
+
+acquire_lock; lrc=$?
+case $lrc in
+  1) print -r -- "$(ts) another run is active, exiting"; exit 0 ;;   # normal overlap
+  2) print -ru2 -- "$(ts) $SELF: cannot create lock $LOCK"; exit 2 ;;
+esac
+
+cleanup() { release_lock; }
+trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 141' HUP PIPE
@@ -120,7 +135,117 @@ trim_log() {
 }
 trim_log "$LOG" "$KEEP_LINES" || true   # explicit: a trim failure must not abort the run
 
+# ── run, retrying once if the credential was unavailable ─────────────────────
+# A run where *every* repo fails with "Permission denied (publickey)" is not a
+# hundred broken repos, it is one missing credential. On macOS the login
+# keychain is not reachable from a cron process until the machine has been
+# interactively unlocked, so a job scheduled before you sit down fails wholesale
+# and a job a few minutes later succeeds. Measured on two consecutive days: the
+# 08:00 runs failed with all 100 repos on publickey, while runs at 08:43, 09:00
+# and 11:55 -- same cron daemon, same script, same config, machine already in
+# use -- all passed. Retrying once, later, turns that into a job that heals
+# itself instead of a status dot nobody looks at until the day it mattered.
+#
+# Deliberately narrow. Only a near-total failure retries, and only once:
+#  - a partial failure means those specific repos are genuinely broken, and
+#    retrying would hide real breakage;
+#  - looping would turn a revoked key into a job that spins all morning.
+# A bad value here must NOT stop the sync. This is a safety net, not core
+# configuration, so an unusable setting warns and falls back. That is the
+# opposite of git-ffwd.sh, where a bad boolean changes what the run does and is
+# therefore fatal.
+#
+# ${VAR-1} rather than ${VAR:-1}: with the colon, an explicitly empty value is
+# replaced by the default before the case is reached, so the documented "off"
+# spelling silently meant "on" and that arm was dead code.
+RETRY=${GIT_FFWD_RETRY_ON_AUTH-1}
+case ${RETRY:l} in                        # :l lowercases, so True and YES work
+  1|true|yes|on)      RETRY=1 ;;
+  0|false|no|off|"")  RETRY=0 ;;
+  *) print -ru2 -- "$(ts) $SELF: WARN ignoring GIT_FFWD_RETRY_ON_AUTH=$RETRY (want 1/0, true/false, yes/no); retry stays enabled"
+     RETRY=1 ;;
+esac
+RETRY_DELAY=${GIT_FFWD_RETRY_DELAY-300}
+if [[ $RETRY_DELAY != <-> ]]; then
+  print -ru2 -- "$(ts) $SELF: WARN ignoring GIT_FFWD_RETRY_DELAY=$RETRY_DELAY (want an integer); using 300"
+  RETRY_DELAY=300
+fi
+
+# Capture only when the retry can actually use it, and keep it inside the lock
+# directory: a SIGKILL leaves the lock behind, and the next run's stale-lock
+# sweep rm -rf's the whole directory, so the scratch file cannot outlive it.
+OUT=""
+new_capture() {
+  OUT=""
+  (( RETRY )) || return 0
+  if : > "$LOCK/run.out" 2>/dev/null; then
+    OUT="$LOCK/run.out"
+  else
+    print -ru2 -- "$(ts) $SELF: WARN cannot write $LOCK/run.out; auth retry disabled for this run"
+    RETRY=0
+  fi
+}
+new_capture
+
+# tee so the run still streams to the log while leaving a copy to inspect.
+# stderr is not redirected, so warnings keep their stream; the failure rows the
+# check below reads are on stdout.
+run_worker() {
+  if [[ -n $OUT ]]; then
+    "$HERE/git-ffwd.sh" | tee "$OUT"
+    return ${pipestatus[1]}
+  fi
+  "$HERE/git-ffwd.sh"
+}
+
+# One missing credential, or N genuinely broken repos?
+# Counts are stashed so the caller can report them without rescanning the file.
+WIPE_SEL=0 WIPE_FAIL=0 WIPE_PK=0
+auth_wipeout() {
+  [[ -n $OUT && -s $OUT ]] || return 1
+  WIPE_SEL=$(sed -n 's/^repos: \([0-9][0-9]*\) selected.*/\1/p' "$OUT" | head -1)
+  [[ -n $WIPE_SEL ]] || { WIPE_SEL=0; return 1 }
+  WIPE_FAIL=$(grep -c "^  failed" "$OUT")
+  # The publickey failures must themselves account for the run. Testing merely
+  # that one exists among a 90% failure rate would call a pile of unrelated
+  # breakage a keychain outage and retry it pointlessly.
+  WIPE_PK=$(grep -c "^  failed.*Permission denied (publickey)" "$OUT")
+  (( WIPE_SEL > 0 && WIPE_PK * 10 >= WIPE_SEL * 9 ))
+}
+
+# Recorded before the retry, because this is the state that could not be
+# captured after the fact: the unified log had already aged out by the time the
+# 08:00 failures were investigated, so the cause stayed inferred.
+diagnose() {
+  print -r -- "$(ts) diagnostics for the wholesale auth failure:"
+  print -r -- "  console user  : $(stat -f '%Su' /dev/console 2>/dev/null || print unknown)"
+  print -r -- "  SSH_AUTH_SOCK : ${SSH_AUTH_SOCK:-(unset)}"
+  print -r -- "  agent         : $(ssh-add -l 2>&1 | head -1)"
+  print -r -- "  login keychain: $(security show-keychain-info "$HOME/Library/Keychains/login.keychain-db" 2>&1 | head -1)"
+}
+
 # Not exec: the EXIT trap above has to survive to release the lock, and exec
 # would replace this process before it could run.
-"$HERE/git-ffwd.sh"
-exit $?
+run_worker
+rc=$?
+if (( rc != 0 && RETRY )) && auth_wipeout; then
+  diagnose
+  print -r -- "$(ts) ${WIPE_PK} of ${WIPE_SEL} repos failed on publickey, so this is one unavailable credential rather than ${WIPE_FAIL} broken repos; retrying once in ${RETRY_DELAY}s"
+  # Release the lock across the wait. Holding it would make anything scheduled
+  # inside the window -- the next cron tick, or a manual rerun -- exit as an
+  # overlap, which lengthens the outage instead of shortening it.
+  release_lock
+  sleep "$RETRY_DELAY"
+  if acquire_lock; then
+    new_capture
+    print -r -- "$(ts) retrying"
+    run_worker
+    rc=$?
+    print -r -- "$(ts) retry finished with exit $rc"
+  else
+    # Something else started while we waited; it is doing this work now, so
+    # adding a second concurrent pass would only fight it for the lock.
+    print -r -- "$(ts) another run started during the wait; leaving the retry to it (this run keeps exit $rc)"
+  fi
+fi
+exit $rc
